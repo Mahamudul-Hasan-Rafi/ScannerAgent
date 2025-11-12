@@ -57,8 +57,8 @@ namespace ScannerAgent
 
         const int WIA_DPS_DOCUMENT_HANDLING_CAPABILITIES = 3086;
         const int WIA_DPS_DOCUMENT_HANDLING_SELECT = 3088;
-        const int WIA_DPS_DOCUMENT_HANDLING_STATUS = 3089;
-        const int WIA_DPS_PAGES = 3096;
+        const int WIA_DPS_DOCUMENT_HANDLING_STATUS = 3087;
+        const int WIA_DPS_PAGES = 3098;
         const int WIA_IPS_XRES = 6147;
         const int WIA_IPS_YRES = 6148;
         const int WIA_IPS_CUR_INTENT = 6146;
@@ -158,6 +158,7 @@ namespace ScannerAgent
             {
                 foreach (Property prop in properties)
                 {
+                    
                     if (prop.PropertyID == propertyId)
                     {
                         return Convert.ToInt32(prop.get_Value());
@@ -292,7 +293,7 @@ namespace ScannerAgent
 
             try
             {
-                //SetProperty(device.Properties, WIA_DPS_DOCUMENT_HANDLING_SELECT, FLATBED);
+                SetProperty(device.Properties, WIA_DPS_DOCUMENT_HANDLING_SELECT, FLATBED);
 
                 Item item = device.Items[1] as Item;
 
@@ -391,7 +392,7 @@ namespace ScannerAgent
                     {
                         if (info.DeviceID == device.DeviceID)
                         {
-                            WIA.Properties infoprop = null;
+                            Properties infoprop = null;
                             infoprop = info.Properties;
 
                             //connect to scanner
@@ -449,12 +450,16 @@ namespace ScannerAgent
                     {
                         item = null;
                         //determine if there are any more pages waiting
+
                         Property documentHandlingSelect = null;
                         Property documentHandlingStatus = null;
                         foreach (Property prop in WiaDev.Properties)
                         {
+                            Console.WriteLine("Prop Id: " + prop.PropertyID+ " WIA DPS HAND SELECT: "+WIA_DPS_DOCUMENT_HANDLING_SELECT);
                             if (prop.PropertyID == WIA_DPS_DOCUMENT_HANDLING_SELECT)
                                 documentHandlingSelect = prop;
+
+                            Console.WriteLine("WIA DPS STATUS: " + WIA_DPS_DOCUMENT_HANDLING_STATUS);
                             if (prop.PropertyID == WIA_DPS_DOCUMENT_HANDLING_STATUS)
                                 documentHandlingStatus = prop;
 
