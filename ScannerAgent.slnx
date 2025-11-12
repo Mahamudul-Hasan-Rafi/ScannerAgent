@@ -1,3 +1,9 @@
 <Solution>
-  <Project Path="ScannerAgent.csproj" Id="488cd0cd-c4c1-47f8-be1e-fbb5916d9d38" />
+  <Configurations>
+    <Platform Name="Any CPU" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="ScannerAgent.csproj" Id="488cd0cd-c4c1-47f8-be1e-fbb5916d9d38">
+    <Platform Solution="*|x86" Project="x86" />
+  </Project>
 </Solution>
