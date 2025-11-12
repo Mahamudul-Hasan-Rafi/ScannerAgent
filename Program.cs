@@ -5,9 +5,8 @@ using System.Net;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
-using WIA; // Ensure COM reference to "Microsoft Windows Image Acquisition Library v2.0" is added
+using WIA;
 
-// This defines the FormatID constants locally, avoiding the interop embedding issue.
 static class WiaFormatID
 {
     public const string wiaFormatBMP = "{B96B3CAB-0728-11D3-9D7B-0000F81EF32E}";
@@ -18,19 +17,56 @@ static class WiaFormatID
 }
 
 namespace ScannerAgent
+
+
 {
+    //class WIA_DPS_DOCUMENT_HANDLING_SELECT
+    //{
+    //    public const uint FEEDER = 0x00000001;
+    //    public const uint FLATBED = 0x00000002;
+    //}
+
+    //class WIA_DPS_DOCUMENT_HANDLING_STATUS
+    //{
+    //    public const uint FEED_READY = 0x00000001;
+    //}
+
+    //class WIA_PROPERTIES
+    //{
+    //    public const uint WIA_RESERVED_FOR_NEW_PROPS = 1024;
+    //    public const uint WIA_DIP_FIRST = 2;
+    //    public const uint WIA_DPA_FIRST = WIA_DIP_FIRST + WIA_RESERVED_FOR_NEW_PROPS;
+    //    public const uint WIA_DPC_FIRST = WIA_DPA_FIRST + WIA_RESERVED_FOR_NEW_PROPS;
+    //    //
+    //    // Scanner only device properties (DPS)
+    //    //
+    //    public const uint WIA_DPS_FIRST = WIA_DPC_FIRST + WIA_RESERVED_FOR_NEW_PROPS;
+    //    public const uint WIA_DPS_DOCUMENT_HANDLING_STATUS = WIA_DPS_FIRST + 13;
+    //    public const uint WIA_DPS_DOCUMENT_HANDLING_SELECT = WIA_DPS_FIRST + 14;
+    //}
+
+    class WIA_ERRORS
+    {
+        public const uint BASE_VAL_WIA_ERROR = 0x80210000;
+        public const uint WIA_ERROR_PAPER_EMPTY = BASE_VAL_WIA_ERROR + 3;
+    }
     class Program
     {
-        // serialize scans so only one runs at a time
         static readonly SemaphoreSlim ScanSemaphore = new SemaphoreSlim(1, 1);
         static readonly TimeSpan ScanTimeout = TimeSpan.FromMinutes(5);
 
+        const int WIA_DPS_DOCUMENT_HANDLING_CAPABILITIES = 3086;
         const int WIA_DPS_DOCUMENT_HANDLING_SELECT = 3088;
         const int WIA_DPS_DOCUMENT_HANDLING_STATUS = 3089;
         const int WIA_DPS_PAGES = 3096;
+        const int WIA_IPS_XRES = 6147;
+        const int WIA_IPS_YRES = 6148;
+        const int WIA_IPS_CUR_INTENT = 6146;
+
         const int FEEDER = 1;
+        const int FLATBED = 4;
+        const int DUPLEX = 8;
         const int FEED_READY = 1;
-        const string wiaFormatJPEG = "{B96B3CAE-0728-11D3-9D7B-0000F81EF32E}";
 
         [STAThread]
         static void Main()
@@ -40,6 +76,12 @@ namespace ScannerAgent
             listener.Prefixes.Add(url);
             listener.Start();
             Console.WriteLine($"Scanner agent running at {url}");
+            Console.WriteLine("Endpoints:");
+            Console.WriteLine("  GET  /ping                  - Health check");
+            Console.WriteLine("  POST /scan?mode=flatbed     - Scan single page from flatbed");
+            Console.WriteLine("  POST /scan?mode=adf         - Scan multiple pages from ADF");
+            Console.WriteLine("  POST /scan?mode=auto        - Auto-detect and use available mode");
+            Console.WriteLine("  POST /scan?mode=X&format=Y  - Specify format (jpeg/png/tiff)");
             Console.WriteLine("Press Ctrl+C to stop.");
 
             while (true)
@@ -56,6 +98,17 @@ namespace ScannerAgent
 
             try
             {
+                // Handle CORS preflight
+                if (req.HttpMethod == "OPTIONS")
+                {
+                    resp.Headers.Add("Access-Control-Allow-Origin", "*");
+                    resp.Headers.Add("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+                    resp.Headers.Add("Access-Control-Allow-Headers", "Content-Type");
+                    resp.StatusCode = 200;
+                    resp.Close();
+                    return;
+                }
+
                 if (req.Url.AbsolutePath == "/ping")
                 {
                     WriteText(resp, "ok");
@@ -64,7 +117,10 @@ namespace ScannerAgent
 
                 if (req.Url.AbsolutePath == "/scan")
                 {
-                    HandleScan(resp);
+                    string mode = req.QueryString["mode"] ?? "auto";
+                    string format = req.QueryString["format"] ?? "jpeg";
+                    int dpi = int.Parse(req.QueryString["dpi"] ?? "300");
+                    HandleScan(resp, mode, format, dpi);
                     return;
                 }
 
@@ -73,8 +129,7 @@ namespace ScannerAgent
             }
             catch (Exception ex)
             {
-                // last-resort error handling for request processing
-                WriteJsonArray(resp, new List<string>(), "Internal error: " + ex.Message);
+                WriteJsonResponse(resp, new List<ScannedImage>(), "Internal error: " + ex.Message);
             }
         }
 
@@ -109,286 +164,88 @@ namespace ScannerAgent
                     }
                 }
             }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Could not get property {propertyId}: {ex.Message}");
-            }
+            catch { }
             return 0;
         }
 
-
-        static void HandleScan(HttpListenerResponse resp)
+        static void HandleScan(HttpListenerResponse resp, string mode, string format, int dpi)
         {
-            // Do not allow concurrent scans
             if (!ScanSemaphore.Wait(0))
             {
-                WriteJsonArray(resp, new List<string>(), "Another scan is in progress");
+                WriteJsonResponse(resp, new List<ScannedImage>(), "Another scan is in progress");
                 return;
             }
 
-            List<string> tempFiles = null;
-
             try
             {
-                // Acquire images on dedicated STA thread via TaskCompletionSource
-                var tcs = new TaskCompletionSource<(List<string> files, string status)>();
+                var tcs = new TaskCompletionSource<(List<ScannedImage> images, string status)>();
 
                 Thread sta = new Thread(() =>
                 {
                     CommonDialog dialog = null;
                     Device device = null;
-                    var files = new List<string>();
+                    var images = new List<ScannedImage>();
                     string status = "ok";
 
                     try
                     {
                         dialog = new CommonDialog();
-
-                        // Let user pick device (UI) -> returns Device or null
                         device = dialog.ShowSelectDevice(WiaDeviceType.ScannerDeviceType, false, false);
+
                         if (device == null)
                         {
-                            tcs.SetResult((new List<string>(), "No scanner selected"));
+                            tcs.SetResult((new List<ScannedImage>(), "No scanner selected"));
                             return;
                         }
 
-                        //try
-                        //{
-                        //    // Get the device's items (scanner)
-                        //    Items items = device.Items;
+                        Console.WriteLine($"Selected device: {device.DeviceID}");
 
-                        //    // Configure common scanner settings
-                        //    SetProperty(items, 6146, 200);  // Horizontal Resolution (DPI)
-                        //    SetProperty(items, 6147, 200);  // Vertical Resolution (DPI)
-                        //    SetProperty(items, 4104, 1);    // Color format: 1 = Color, 2 = Grayscale, 4 = B&W
-                        //    SetProperty(items, 4106, 0);    // Brightness
-                        //    SetProperty(items, 4107, 0);    // Contrast
-                        //    SetProperty(items, 6154, 1);    // Page Size: 1 = Letter, etc.
-                        //}
-                        //catch (Exception ex)
-                        //{
-                        //    Console.WriteLine($"Warning: Could not set device properties: {ex.Message}");
-                        //}
+                        int capabilities = GetProperty(device.Properties, WIA_DPS_DOCUMENT_HANDLING_CAPABILITIES);
+                        bool hasFlatbed = (capabilities & FLATBED) != 0;
+                        bool hasFeeder = (capabilities & FEEDER) != 0;
 
+                        Console.WriteLine($"Capabilities: {capabilities}");
 
-                        //// Acquire images: single ImageFile or collection (multi-page)
-                        //object scanResult = dialog.ShowAcquireImage(
-                        //    WiaDeviceType.ScannerDeviceType,
-                        //    WiaImageIntent.UnspecifiedIntent,
-                        //    WiaImageBias.MaximizeQuality,
-                        //    "{B96B3CB1-0728-11D3-9D7B-0000F81EF32E}", // replace with literal value
-                        //    true,  // show UI
-                        //    true,  // allow multi-image (ADF)
-                        //    false
-                        //);
+                        Console.WriteLine($"Flatbed: {hasFlatbed}, Feeder: {hasFeeder}");
 
-
-                        //if(scanResult != null)
-                        //{
-                        //    Type resultType = scanResult.GetType();
-                        //    string typeName = resultType.Name;
-
-                        //    Console.WriteLine($"Typename:  {typeName}");
-
-                        //    if(typeName.Contains("vector") || typeName.Contains("Collection"))
-                        //    {
-                        //        Console.WriteLine("World - Multiple images detected");
-
-                        //        try
-                        //        {
-                        //            // Use dynamic to access COM Vector
-                        //            dynamic vector = scanResult;
-                        //            int count = vector.Count;
-                        //            Console.WriteLine($"Image count: {count}");
-
-                        //            // WIA Vector is 1-indexed
-                        //            for (int i = 1; i <= count; i++)
-                        //            {
-                        //                ImageFile img = (ImageFile)vector[i];
-                        //                files.Add(SaveImageFileToTemp(img));
-                        //                ReleaseCom(img);
-                        //            }
-                        //        }
-                        //        catch (Exception ex)
-                        //        {
-                        //            Console.WriteLine($"Error processing vector: {ex.Message}");
-
-                        //            // Fallback: try IEnumerable
-                        //            if (scanResult is System.Collections.IEnumerable enumerable)
-                        //            {
-                        //                foreach (var item in enumerable)
-                        //                {
-                        //                    if (item == null) continue;
-                        //                    ImageFile img = item as ImageFile ?? (ImageFile)item;
-                        //                    files.Add(SaveImageFileToTemp(img));
-                        //                    ReleaseCom(img);
-                        //                }
-                        //            }
-                        //        }
-                        //    }
-                        //    else if (scanResult is ImageFile singleImage)
-                        //    {
-                        //        Console.WriteLine("Hello");
-                        //        files.Add(SaveImageFileToTemp(singleImage));
-                        //        ReleaseCom(singleImage);
-                        //    }
-                        //    //else if (scanResult is System.Collections.IEnumerable enumerable)
-                        //    //{
-                        //    //    Console.WriteLine("World");
-                        //    //    foreach (var item in enumerable)
-                        //    //    {
-                        //    //        if (item == null) continue;
-                        //    //        ImageFile img = item as ImageFile;
-                        //    //        if (img == null)
-                        //    //        {
-                        //    //            try { img = (ImageFile)item; } catch { continue; }
-                        //    //        }
-                        //    //        files.Add(SaveImageFileToTemp(img));
-                        //    //        ReleaseCom(img);
-                        //    //    }
-                        //    //}
-                        //    else
-                        //    {
-                        //        status = "No image acquired";
-                        //    }
-
-                        //}
-                        //  tcs.SetResult((files, status));
-
-                        //**********************************************************************//
-                        //Item item = device.Items[1]; // Get first item (scanner)
-
-                        //// Configure ADF settings
-                        //Program.SetProperty(item.Properties, "3088", 1); // Document Handling Select: 1 = Flatbed, 4 = ADF
-
-                        //// Configure other properties
-                        //Program.SetProperty(item.Properties, "6146", 200);  // Horizontal Resolution
-                        //Program.SetProperty(item.Properties, "6147", 200);  // Vertical Resolution
-                        //Program.SetProperty(item.Properties, "4104", 1);    // Color format: Color
-
-                        //// Check if ADF is available and has documents
-                        //int documentHandling = GetPropertyInt(item.Properties, "3088");
-                        //bool hasADF = (documentHandling & 0x00000004) != 0; // Check ADF bit
-                        //bool hasDocuments = (documentHandling & 0x00000002) != 0; // Check document feeder ready bit
-
-                        //Console.WriteLine($"ADF available: {hasADF}, Documents ready: {hasDocuments}");
-
-                        //if (hasADF && hasDocuments)
-                        //{
-                        //    // Scan multiple pages using ADF
-                        //    bool morePages = true;
-                        //    while (morePages)
-                        //    {
-                        //        try
-                        //        {
-                        //            ImageFile image = (ImageFile)item.Transfer(WiaFormatID.wiaFormatJPEG);
-                        //            if (image != null)
-                        //            {
-                        //                files.Add(SaveImageFileToTemp(image));
-                        //                ReleaseCom(image);
-                        //                Console.WriteLine("Scanned page successfully");
-                        //            }
-
-                        //            // Check if more pages
-                        //            documentHandling = GetPropertyInt(item.Properties, "3088");
-                        //            morePages = (documentHandling & 0x00000003) != 0; // Check feeder has more documents
-                        //        }
-                        //        catch (Exception ex)
-                        //        {
-                        //            if (ex.Message.Contains("No documents") || ex.Message.Contains("feeder is empty"))
-                        //            {
-                        //                morePages = false;
-                        //                Console.WriteLine("ADF empty");
-                        //            }
-                        //            else
-                        //            {
-                        //                throw;
-                        //            }
-                        //        }
-                        //    }
-                        //}
-                        //else
-                        //{
-                        //    // Single page scan
-                        //    ImageFile image = (ImageFile)item.Transfer(WiaFormatID.wiaFormatJPEG);
-                        //    if (image != null)
-                        //    {
-                        //        files.Add(SaveImageFileToTemp(image));
-                        //        ReleaseCom(image);
-                        //    }
-                        //}
-
-                        SetProperty(device.Properties, WIA_DPS_DOCUMENT_HANDLING_SELECT, FEEDER);
-                        // Set Pages to 0 for continuous scan until empty
-                        SetProperty(device.Properties, WIA_DPS_PAGES, 0);
-
-                        Console.WriteLine("KO");
-
-                        bool hasMorePages = true;
-
-                        while (hasMorePages)
+                        string actualMode = mode.ToLower();
+                        if (actualMode == "auto")
                         {
-                            try
+                            if (hasFeeder)
                             {
-                                // 3. Get the first item, which the driver uses as a proxy for the ADF stream
-                                Item item = device.Items[1] as Item;
-
-                                // 4. Transfer the image (this triggers the scan of one page)
-                                //Console.WriteLine("pas");
-                                //ImageFile imageFile = (ImageFile)item.Transfer(WiaFormatID.wiaFormatTIFF);
-                                //Console.WriteLine("ad");
-                                ImageFile imageFile = null;
-
-                                try
-                                {
-                                    imageFile = (ImageFile)item.Transfer(WiaFormatID.wiaFormatTIFF);
-                                    Console.WriteLine(imageFile.ToString());
-                                }
-                                catch (COMException transferEx)
-                                {
-                                    // Known WIA code when feeder empty: 0x80210003 (WINCODEC_ERR or WIA error); stop loop
-                                    int hr = transferEx.ErrorCode;
-                                    if (hr == unchecked((int)0x80210003))
-                                    {
-                                        Console.WriteLine("Feeder empty / no more pages.");
-                                        break;
-                                    }
-                                    throw;
-                                }
-
-                                if (imageFile != null)
-                                {
-                                    files.Add(SaveImageFileToTemp(imageFile));
-                                    ReleaseCom(imageFile);
-                                }
-                                
-                                Console.WriteLine($"Scanned page {files.Count}");
-
-                                // 5. Check if there are more pages ready in the feeder
-                                int documentHandlingStatus = GetProperty(device.Properties, WIA_DPS_DOCUMENT_HANDLING_STATUS);
-                                hasMorePages = ((documentHandlingStatus & FEED_READY) != 0);
+                                int handlingStatus = GetProperty(device.Properties, WIA_DPS_DOCUMENT_HANDLING_STATUS);
+                                bool feederReady = (handlingStatus & FEED_READY) != 0;
+                                actualMode = feederReady ? "adf" : "flatbed";
                             }
-                            catch (Exception ex)
+                            else
                             {
-                                // A common WIA error (0x80210003) indicates the feeder is empty.
-                                // You may need to handle specific COM exceptions here.
-                                if (ex.Message.Contains("0x80210003"))
-                                {
-                                    Console.WriteLine("ADF is empty. Scanning complete.");
-                                    hasMorePages = false;
-                                }
-                                else
-                                {
-                                    Console.WriteLine($"An error occurred: {ex.Message}");
-                                    hasMorePages = false; // Stop on unexpected errors
-                                }
+                                actualMode = "flatbed";
                             }
+                            Console.WriteLine($"Auto mode selected: {actualMode}");
                         }
 
+                        
+                        string wiaFormat = GetWiaFormat(format);
+
+                        if (actualMode == "adf" && hasFeeder)
+                        {
+                            images = ScanFromFeeder(device, wiaFormat, dpi);
+                        }
+                        else if (actualMode == "flatbed" || !hasFeeder)
+                        {
+                            images = ScanFromFlatbed(device, wiaFormat, dpi);
+                        }
+                        else
+                        {
+                            status = $"Requested mode '{mode}' not available";
+                        }
+
+                        tcs.SetResult((images, status));
                     }
                     catch (Exception ex)
                     {
-                        tcs.SetResult((new List<string>(), "Scan failed: " + ex.Message));
+                        Console.WriteLine($"Scan error: {ex.Message}");
+                        tcs.SetResult((new List<ScannedImage>(), "Scan failed: " + ex.Message));
                     }
                     finally
                     {
@@ -403,42 +260,262 @@ namespace ScannerAgent
 
                 if (!tcs.Task.Wait(ScanTimeout))
                 {
-                    WriteJsonArray(resp, new List<string>(), "Scan timed out");
+                    WriteJsonResponse(resp, new List<ScannedImage>(), "Scan timed out");
                     return;
                 }
 
                 var result = tcs.Task.Result;
-                tempFiles = result.files;
-                // By default return file paths to reduce memory. You can change this to return base64 by reading the files.
-                WriteJsonArray(resp, result.files, result.status);
+                Console.WriteLine($"Scan completed: {result.images.Count} pages");
+                WriteJsonResponse(resp, result.images, result.status);
             }
             finally
             {
-
-                // cleanup temp files
-                if (tempFiles != null)
-                {
-                    foreach (var f in tempFiles)
-                    {
-                        try { File.Delete(f); } catch { }
-                    }
-                }
-
                 ScanSemaphore.Release();
             }
         }
-       
 
- 
-        // Save ImageFile to a temp file and return the path
-        static string SaveImageFileToTemp(ImageFile img)
+        static string GetWiaFormat(string format)
         {
-            string tempPath = Path.Combine(Path.GetTempPath(), "scanneragent_" + Guid.NewGuid().ToString() + ".jpg");
-            img.SaveFile(tempPath);
-            return tempPath;
+            switch (format.ToLower())
+            {
+                case "png": return WiaFormatID.wiaFormatPNG;
+                case "tiff": return WiaFormatID.wiaFormatTIFF;
+                case "bmp": return WiaFormatID.wiaFormatBMP;
+                default: return WiaFormatID.wiaFormatJPEG;
+            }
         }
 
-        // Safe COM release helper
+        static List<ScannedImage> ScanFromFlatbed(Device device, string wiaFormat, int dpi)
+        {
+            Console.WriteLine("Scanning from flatbed...");
+            var images = new List<ScannedImage>();
+
+            try
+            {
+                //SetProperty(device.Properties, WIA_DPS_DOCUMENT_HANDLING_SELECT, FLATBED);
+
+                Item item = device.Items[1] as Item;
+
+                if (item == null)
+                {
+                   throw new Exception("No flatbed item found");
+                }
+
+                Console.WriteLine($"Item name: {item.ItemID}");
+
+                SetProperty(item.Properties, WIA_IPS_XRES, dpi);
+                SetProperty(item.Properties, WIA_IPS_YRES, dpi);
+
+                try
+                {
+                    SetProperty(item.Properties, WIA_IPS_CUR_INTENT, 4); // Color
+                }
+                catch (Exception intentEx)
+                {
+                    Console.WriteLine($"Warning: Could not set color intent: {intentEx.Message}");
+                }
+
+
+                Console.WriteLine("Starting transfer...");
+
+                ImageFile imageFile = null;
+                try
+                {
+                    imageFile = (ImageFile)item.Transfer(wiaFormat);
+                }
+                catch (COMException comEx)
+                {
+                    int errorCode = comEx.ErrorCode;
+                    Console.WriteLine($"COM Exception during transfer: 0x{errorCode:X8}");
+                    Console.WriteLine($"Error message: {comEx.Message}");
+
+                    // Common WIA error codes
+                    switch (errorCode)
+                    {
+                        case unchecked((int)0x80210015): // WIA_ERROR_PAPER_EMPTY
+                            throw new Exception("No document in scanner");
+                        case unchecked((int)0x80210006): // WIA_ERROR_PAPER_JAM
+                            throw new Exception("Paper jam detected");
+                        case unchecked((int)0x80210001): // WIA_ERROR_GENERAL_ERROR
+                            throw new Exception("General scanner error - check if scanner is ready");
+                        case unchecked((int)0x8021000C): // WIA_ERROR_DEVICE_BUSY
+                            throw new Exception("Scanner is busy");
+                        case unchecked((int)0x80210005): // WIA_ERROR_OFFLINE
+                            throw new Exception("Scanner is offline");
+                        default:
+                            throw new Exception($"Scanner error: 0x{errorCode:X8} - {comEx.Message}");
+                    }
+                }
+
+                if (imageFile != null)
+                {
+                    images.Add(ConvertImageToBase64(imageFile, 1));
+                    ReleaseCom(imageFile);
+                    Console.WriteLine("Flatbed scan completed");
+                }
+            }
+            catch (COMException comEx)
+            {
+                Console.WriteLine($"COM Exception: 0x{comEx.ErrorCode:X8} - {comEx.Message}");
+                throw new Exception($"Scanner COM error: 0x{comEx.ErrorCode:X8} - {comEx.Message}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Flatbed scan error: {ex.Message}");
+                Console.WriteLine($"Stack trace: {ex.StackTrace}");
+                throw;
+            }
+
+            return images;
+        }
+
+        static List<ScannedImage> ScanFromFeeder(Device device, string wiaFormat, int dpi)
+        {
+            Console.WriteLine("Scanning from ADF...");
+            var images = new List<ScannedImage>();
+
+            try
+            {
+                SetProperty(device.Properties, WIA_DPS_DOCUMENT_HANDLING_SELECT, FEEDER);
+                //SetProperty(device.Properties, WIA_DPS_PAGES, 0);
+                    
+                bool hasMorePages = true;
+                int pageCount = 0;
+                int x = 0;
+
+                while (hasMorePages)
+                {
+                    DeviceManager manager = (DeviceManager)Activator.CreateInstance(Type.GetTypeFromProgID("WIA.DeviceManager"));
+                    Device WiaDev = null;
+                    foreach (DeviceInfo info in manager.DeviceInfos)
+                    {
+                        if (info.DeviceID == device.DeviceID)
+                        {
+                            WIA.Properties infoprop = null;
+                            infoprop = info.Properties;
+
+                            //connect to scanner
+                            WiaDev = info.Connect();
+
+
+                            break;
+                        }
+                    }
+
+
+                    ImageFile imageFile = null;
+                    Item item = device.Items[1] as Item;
+                    try
+                    {
+                       
+                        SetProperty(item.Properties, WIA_IPS_XRES, dpi);
+                        SetProperty(item.Properties, WIA_IPS_YRES, dpi);
+                        SetProperty(item.Properties, WIA_IPS_CUR_INTENT, 4);
+
+                        try
+                        {
+                            imageFile = (ImageFile)item.Transfer(wiaFormat);
+                        }
+                        catch (COMException comEx)
+                        {
+                            int hr = comEx.ErrorCode;
+                            if (hr == unchecked((int)0x80210003) || hr == unchecked((int)0x80210006))
+                            {
+                                Console.WriteLine("Feeder empty");
+                                break;
+                            }
+                            throw;
+                        }
+
+                        if (imageFile != null)
+                        {
+                            pageCount++;
+                            images.Add(ConvertImageToBase64(imageFile, pageCount));
+                            ReleaseCom(imageFile);
+                            Console.WriteLine($"Scanned page {pageCount}");
+                            Console.WriteLine("OKA");
+                        }
+
+             
+                    }
+                   
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"Error: {ex.Message}");
+                        hasMorePages = false;
+                    }
+
+                    finally
+                    {
+                        item = null;
+                        //determine if there are any more pages waiting
+                        Property documentHandlingSelect = null;
+                        Property documentHandlingStatus = null;
+                        foreach (Property prop in WiaDev.Properties)
+                        {
+                            if (prop.PropertyID == WIA_DPS_DOCUMENT_HANDLING_SELECT)
+                                documentHandlingSelect = prop;
+                            if (prop.PropertyID == WIA_DPS_DOCUMENT_HANDLING_STATUS)
+                                documentHandlingStatus = prop;
+
+
+                        }
+
+                        hasMorePages = false; //assume there are no more pages
+                        if (documentHandlingSelect != null)
+                        //may not exist on flatbed scanner but required for feeder
+                        {
+                            //check for document feeder
+                            if ((Convert.ToUInt32(documentHandlingSelect.get_Value()) & FEEDER) != 0)
+                            {
+                                hasMorePages = ((Convert.ToUInt32(documentHandlingStatus.get_Value()) & FEED_READY) != 0);
+                            }
+                        }
+                        x++;
+                        Console.WriteLine("Loop " + x.ToString());
+                        Console.WriteLine(hasMorePages.ToString());
+                    }
+                }
+
+                Console.WriteLine($"ADF completed: {pageCount} pages");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Feeder error: {ex.Message}");
+                throw;
+            }
+
+            return images;
+        }
+
+        static ScannedImage ConvertImageToBase64(ImageFile imageFile, int pageNumber)
+        {
+            string tempPath = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString() + ".tmp");
+
+            try
+            {
+                imageFile.SaveFile(tempPath);
+                byte[] imageBytes = File.ReadAllBytes(tempPath);
+                string base64 = Convert.ToBase64String(imageBytes);
+
+                string mimeType = "image/jpeg";
+                if (imageFile.FormatID == WiaFormatID.wiaFormatPNG) mimeType = "image/png";
+                else if (imageFile.FormatID == WiaFormatID.wiaFormatTIFF) mimeType = "image/tiff";
+
+                return new ScannedImage
+                {
+                    PageNumber = pageNumber,
+                    Base64Data = $"data:{mimeType};base64,{base64}",
+                    Size = imageBytes.Length,
+                    Format = mimeType
+                };
+            }
+            finally
+            {
+                try { File.Delete(tempPath); } catch { }
+            }
+        }
+
         static void ReleaseCom(object comObj)
         {
             if (comObj == null) return;
@@ -446,30 +523,31 @@ namespace ScannerAgent
             {
                 while (Marshal.ReleaseComObject(comObj) > 0) { }
             }
-            catch { /* ignore */ }
-            finally
-            {
-                comObj = null;
-            }
+            catch { }
         }
 
         static void WriteText(HttpListenerResponse resp, string text)
         {
             resp.ContentType = "text/plain; charset=utf-8";
+            resp.Headers.Add("Access-Control-Allow-Origin", "*");
             var writer = new StreamWriter(resp.OutputStream);
             writer.Write(text);
             writer.Flush();
             resp.OutputStream.Close();
         }
 
-        static void WriteJsonArray(HttpListenerResponse resp, List<string> imagesOrPaths, string status)
+        static void WriteJsonResponse(HttpListenerResponse resp, List<ScannedImage> images, string status)
         {
             resp.ContentType = "application/json; charset=utf-8";
-            resp.Headers.Add("Access-Control-Allow-Origin", "*"); // adjust for production
+            resp.Headers.Add("Access-Control-Allow-Origin", "*");
 
-            // imagesOrPaths contains file paths (default). If you want base64, read files first.
-            string itemsJson = string.Join(",", imagesOrPaths.ConvertAll(i => $"\"{EscapeJsonString(i)}\""));
-            string json = $"{{\"status\":\"{EscapeJsonString(status)}\",\"files\":[{itemsJson}]}}";
+            var imagesJson = new List<string>();
+            foreach (var img in images)
+            {
+                imagesJson.Add($"{{\"pageNumber\":{img.PageNumber},\"base64\":\"{EscapeJsonString(img.Base64Data)}\",\"size\":{img.Size},\"format\":\"{img.Format}\"}}");
+            }
+
+            string json = $"{{\"status\":\"{EscapeJsonString(status)}\",\"pageCount\":{images.Count},\"images\":[{string.Join(",", imagesJson)}]}}";
 
             var writer = new StreamWriter(resp.OutputStream);
             writer.Write(json);
@@ -479,7 +557,16 @@ namespace ScannerAgent
 
         static string EscapeJsonString(string s)
         {
-            return s?.Replace("\\", "\\\\").Replace("\"", "\\\"") ?? string.Empty;
+            if (string.IsNullOrEmpty(s)) return string.Empty;
+            return s.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\n", "\\n").Replace("\r", "\\r");
         }
+    }
+
+    class ScannedImage
+    {
+        public int PageNumber { get; set; }
+        public string Base64Data { get; set; }
+        public long Size { get; set; }
+        public string Format { get; set; }
     }
 }
