@@ -63,6 +63,10 @@ namespace ScannerAgent
         const int WIA_IPS_YRES = 6148;
         const int WIA_IPS_CUR_INTENT = 6146;
 
+        const int WIA_INTENT_TEXT = 1;
+        const int WIA_INTENT_GRAYSCALE = 2;
+        const int WIA_INTENT_COLOR = 4;
+
         const int FEEDER = 1;
         const int FLATBED = 4;
         const int DUPLEX = 8;
@@ -72,7 +76,7 @@ namespace ScannerAgent
         static void Main()
         {
             var listener = new HttpListener();
-            string url = "http://localhost:9257/";
+            string url = "http://10.11.200.110:9257/";
             listener.Prefixes.Add(url);
             listener.Start();
             Console.WriteLine($"Scanner agent running at {url}");
@@ -109,18 +113,26 @@ namespace ScannerAgent
                     return;
                 }
 
-                if (req.Url.AbsolutePath == "/ping")
+                if (req.Url.AbsolutePath == "/ping" && req.HttpMethod=="GET")
                 {
                     WriteText(resp, "ok");
                     return;
                 }
 
-                if (req.Url.AbsolutePath == "/scan")
+                if (req.Url.AbsolutePath == "/scan" && req.HttpMethod=="POST")
                 {
                     string mode = req.QueryString["mode"] ?? "auto";
                     string format = req.QueryString["format"] ?? "jpeg";
                     int dpi = int.Parse(req.QueryString["dpi"] ?? "300");
-                    HandleScan(resp, mode, format, dpi);
+                    int color = int.Parse(req.QueryString["color"] ?? "4");
+                    string deviceId = req.QueryString["deviceId"];
+                    HandleScan(resp, mode, format, dpi, color, deviceId);
+                    return;
+                }
+
+                if(req.Url.AbsolutePath == "/devices" && req.HttpMethod=="GET")
+                {
+                    ListDevices(resp);
                     return;
                 }
 
@@ -129,8 +141,108 @@ namespace ScannerAgent
             }
             catch (Exception ex)
             {
-                WriteJsonResponse(resp, new List<ScannedImage>(), "Internal error: " + ex.Message);
+                WriteJsonResponse(resp, new List<ScannedImage>(), "Internal error: " + ex.Message, 500);
             }
+        }
+
+        private static void ListDevices(HttpListenerResponse resp)
+        {
+            try
+            {
+                var manager = new DeviceManager();
+                var devicesJson = new List<string>();
+
+                foreach(DeviceInfo info in manager.DeviceInfos)
+                {
+                    string id = info.DeviceID ?? "";
+                    string name = null;
+                    string type = info.Type.ToString();
+
+                    try
+                    {
+                        var props = info.Properties;
+                        try
+                        {
+                            var propName = props["Name"];
+                            if(propName != null)
+                            {
+                                name = propName.get_Value() as string;
+                            }
+                        }
+                        catch { }
+
+
+                        if(string.IsNullOrEmpty(name))
+                        {
+                            foreach(Property prop in props)
+                            {
+                                if(prop.PropertyID==2)
+                                {
+                                    name = prop.get_Value()?.ToString();
+                                    break;
+                                }
+                            }
+                        }
+
+                    }
+                    catch { }
+
+                    if(string.IsNullOrEmpty(name))
+                    {
+                        name = id;
+                    }
+
+                    devicesJson.Add($"{{\"id\":\"{EscapeJsonString(id)}\",\"name\":\"{EscapeJsonString(name)}\",\"type\":\"{EscapeJsonString(type)}\"}}");
+                }
+
+                string json = $"{{\"status\":\"ok\",\"deviceCount\":{devicesJson.Count},\"devices\":[{string.Join(",", devicesJson)}]}}";
+                resp.ContentType = "application/json; charset=utf-8";
+                resp.Headers.Add("Access-Control-Allow-Origin", "*");
+
+                using (var writer = new StreamWriter(resp.OutputStream))
+                {
+                    writer.Write(json);
+                    writer.Flush();
+                }
+            }
+            catch(Exception ex)
+            {
+                WriteJsonResponse(resp, new List<ScannedImage>(), "Error listing devices: " + ex.Message, 500);
+            }
+        }
+
+        static Device ConnectToDeviceById(string deviceId)
+        {
+            deviceId = deviceId.Replace("\\\\", "\\");
+
+            if (string.IsNullOrEmpty(deviceId)) return null;
+            try
+            {
+                var manager = new DeviceManager();
+                foreach (DeviceInfo info in manager.DeviceInfos)
+                {
+                    Console.WriteLine("Device Id: " + info.DeviceID);
+
+                    if (string.Equals(info.DeviceID, deviceId, StringComparison.OrdinalIgnoreCase))
+                    {
+                        Console.WriteLine("Matched");
+                        try
+                        {
+                            return info.Connect();
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine($"Failed to connect to device {deviceId}: {ex.Message}");
+                            return null;
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"ConnectToDeviceById error: {ex.Message}");
+            }
+            return null;
         }
 
         private static void SetProperty(Properties properties, int propertyId, object value)
@@ -169,17 +281,29 @@ namespace ScannerAgent
             return 0;
         }
 
-        static void HandleScan(HttpListenerResponse resp, string mode, string format, int dpi)
+        class ScannerException: Exception
         {
+            public int ErrorCode { get;  }
+            public ScannerException(int errorCode, string message) : base(message) => ErrorCode = errorCode;
+
+        }
+           
+
+
+        static void HandleScan(HttpListenerResponse resp, string mode, string format, int dpi, int color, string deviceId=null)
+        {
+            
+           
             if (!ScanSemaphore.Wait(0))
             {
-                WriteJsonResponse(resp, new List<ScannedImage>(), "Another scan is in progress");
+                WriteJsonResponse(resp, new List<ScannedImage>(), "Another scan is in progress", 423);
                 return;
             }
 
             try
             {
-                var tcs = new TaskCompletionSource<(List<ScannedImage> images, string status)>();
+                var tcs = new TaskCompletionSource<(List<ScannedImage> images, string status, int statusCode)>();
+               
 
                 Thread sta = new Thread(() =>
                 {
@@ -188,16 +312,36 @@ namespace ScannerAgent
                     var images = new List<ScannedImage>();
                     string status = "ok";
 
+                    
+
                     try
                     {
-                        dialog = new CommonDialog();
-                        device = dialog.ShowSelectDevice(WiaDeviceType.ScannerDeviceType, false, false);
-
-                        if (device == null)
+                        //dialog = new CommonDialog();
+                        //device = dialog.ShowSelectDevice(WiaDeviceType.ScannerDeviceType, false, false);
+                        if (!string.IsNullOrEmpty(deviceId))
                         {
-                            tcs.SetResult((new List<ScannedImage>(), "No scanner selected"));
-                            return;
+                            device = ConnectToDeviceById(deviceId);
+                            if (device == null)
+                            {
+                                tcs.SetResult((new List<ScannedImage>(), $"Device with id '{deviceId}' not found or failed to connect", 404));
+                                return;
+                            }
                         }
+
+                        else
+                        {
+                            //dialog = new CommonDialog();
+                            //device = dialog.ShowSelectDevice(WiaDeviceType.ScannerDeviceType, false, false);
+
+                            //if (device == null)
+                            //{
+                            //    tcs.SetResult((new List<ScannedImage>(), "No scanner selected"));
+                            //    return;
+                            //}
+                            Console.WriteLine("Device Id: " + deviceId);
+                        }
+
+
 
                         Console.WriteLine($"Selected device: {device.DeviceID}");
 
@@ -230,23 +374,23 @@ namespace ScannerAgent
 
                         if (actualMode == "adf" && hasFeeder)
                         {
-                            images = ScanFromFeeder(device, wiaFormat, dpi);
+                            images = ScanFromFeeder(device, wiaFormat, dpi, color);
                         }
                         else if (actualMode == "flatbed" || !hasFeeder)
                         {
-                            images = ScanFromFlatbed(device, wiaFormat, dpi);
+                            images = ScanFromFlatbed(device, wiaFormat, dpi, color);
                         }
                         else
                         {
                             status = $"Requested mode '{mode}' not available";
                         }
 
-                        tcs.SetResult((images, status));
+                        tcs.SetResult((images, status, 200));
                     }
                     catch (Exception ex)
                     {
                         Console.WriteLine($"Scan error: {ex.Message}");
-                        tcs.SetResult((new List<ScannedImage>(), "Scan failed: " + ex.Message));
+                        tcs.SetResult((new List<ScannedImage>(), "Scan failed: " + ex.Message, 500));
                     }
                     finally
                     {
@@ -261,13 +405,13 @@ namespace ScannerAgent
 
                 if (!tcs.Task.Wait(ScanTimeout))
                 {
-                    WriteJsonResponse(resp, new List<ScannedImage>(), "Scan timed out");
+                    WriteJsonResponse(resp, new List<ScannedImage>(), "Scan timed out", 408);
                     return;
                 }
 
                 var result = tcs.Task.Result;
                 Console.WriteLine($"Scan completed: {result.images.Count} pages");
-                WriteJsonResponse(resp, result.images, result.status);
+                WriteJsonResponse(resp, result.images, result.status, result.statusCode);
             }
             finally
             {
@@ -286,7 +430,7 @@ namespace ScannerAgent
             }
         }
 
-        static List<ScannedImage> ScanFromFlatbed(Device device, string wiaFormat, int dpi)
+        static List<ScannedImage> ScanFromFlatbed(Device device, string wiaFormat, int dpi, int color)
         {
             Console.WriteLine("Scanning from flatbed...");
             var images = new List<ScannedImage>();
@@ -309,7 +453,7 @@ namespace ScannerAgent
 
                 try
                 {
-                    SetProperty(item.Properties, WIA_IPS_CUR_INTENT, 4); // Color
+                    SetProperty(item.Properties, WIA_IPS_CUR_INTENT, color); // Color
                 }
                 catch (Exception intentEx)
                 {
@@ -334,17 +478,17 @@ namespace ScannerAgent
                     switch (errorCode)
                     {
                         case unchecked((int)0x80210015): // WIA_ERROR_PAPER_EMPTY
-                            throw new Exception("No document in scanner");
+                            throw new ScannerException(errorCode, "No document in scanner");
                         case unchecked((int)0x80210006): // WIA_ERROR_PAPER_JAM
-                            throw new Exception("Paper jam detected");
+                            throw new ScannerException(errorCode, "Paper jam detected");
                         case unchecked((int)0x80210001): // WIA_ERROR_GENERAL_ERROR
-                            throw new Exception("General scanner error - check if scanner is ready");
+                            throw new ScannerException(errorCode, "General scanner error - check if scanner is ready");
                         case unchecked((int)0x8021000C): // WIA_ERROR_DEVICE_BUSY
-                            throw new Exception("Scanner is busy");
+                            throw new ScannerException(errorCode, "Scanner is busy");
                         case unchecked((int)0x80210005): // WIA_ERROR_OFFLINE
-                            throw new Exception("Scanner is offline");
+                            throw new ScannerException(errorCode, "Scanner is offline");
                         default:
-                            throw new Exception($"Scanner error: 0x{errorCode:X8} - {comEx.Message}");
+                            throw new ScannerException(errorCode, $"Scanner error: 0x{errorCode:X8} - {comEx.Message}");
                     }
                 }
 
@@ -358,7 +502,7 @@ namespace ScannerAgent
             catch (COMException comEx)
             {
                 Console.WriteLine($"COM Exception: 0x{comEx.ErrorCode:X8} - {comEx.Message}");
-                throw new Exception($"Scanner COM error: 0x{comEx.ErrorCode:X8} - {comEx.Message}");
+                throw new ScannerException(comEx.ErrorCode, $"Scanner COM error: 0x{comEx.ErrorCode:X8} - {comEx.Message}");
             }
             catch (Exception ex)
             {
@@ -370,7 +514,7 @@ namespace ScannerAgent
             return images;
         }
 
-        static List<ScannedImage> ScanFromFeeder(Device device, string wiaFormat, int dpi)
+        static List<ScannedImage> ScanFromFeeder(Device device, string wiaFormat, int dpi, int color)
         {
             Console.WriteLine("Scanning from ADF...");
             var images = new List<ScannedImage>();
@@ -411,7 +555,7 @@ namespace ScannerAgent
                        
                         SetProperty(item.Properties, WIA_IPS_XRES, dpi);
                         SetProperty(item.Properties, WIA_IPS_YRES, dpi);
-                        SetProperty(item.Properties, WIA_IPS_CUR_INTENT, 4);
+                        SetProperty(item.Properties, WIA_IPS_CUR_INTENT, color);
 
                         try
                         {
@@ -419,14 +563,41 @@ namespace ScannerAgent
                         }
                         catch (COMException comEx)
                         {
-                            int hr = comEx.ErrorCode;
-                            if (hr == unchecked((int)0x80210003) || hr == unchecked((int)0x80210006))
+                            int errorCode = comEx.ErrorCode;
+                            Console.WriteLine($"COM Exception during transfer: 0x{errorCode:X8}");
+                            Console.WriteLine($"Error message: {comEx.Message}");
+
+                            // Common WIA error codes
+                            switch (errorCode)
                             {
-                                Console.WriteLine("Feeder empty");
-                                break;
+                                case unchecked((int)0x80210015): // WIA_ERROR_PAPER_EMPTY
+                                    throw new ScannerException(errorCode, "No document in scanner");
+                                case unchecked((int)0x80210006): // WIA_ERROR_PAPER_JAM
+                                    throw new ScannerException(errorCode, "Paper jam detected");
+                                case unchecked((int)0x80210001): // WIA_ERROR_GENERAL_ERROR
+                                    throw new ScannerException(errorCode, "General scanner error - check if scanner is ready");
+                                case unchecked((int)0x8021000C): // WIA_ERROR_DEVICE_BUSY
+                                    throw new ScannerException(errorCode, "Scanner is busy");
+                                case unchecked((int)0x80210005): // WIA_ERROR_OFFLINE
+                                    throw new ScannerException(errorCode, "Scanner is offline");
+                                case unchecked((int)0x80210003):
+                                    Console.WriteLine("Feeder empty");
+                                    hasMorePages = false;
+                                    break;
+                                default:
+                                    throw new ScannerException(errorCode, $"Scanner error: 0x{errorCode:X8} - {comEx.Message}");
                             }
-                            throw;
                         }
+                        //catch (COMException comEx)
+                        //{
+                        //    int hr = comEx.ErrorCode;
+                        //    if (hr == unchecked((int)0x80210003) || hr == unchecked((int)0x80210006))
+                        //    {
+                        //        Console.WriteLine("Feeder empty");
+                        //        break;
+                        //    }
+                        //    throw;
+                        //}
 
                         if (imageFile != null)
                         {
@@ -541,8 +712,9 @@ namespace ScannerAgent
             resp.OutputStream.Close();
         }
 
-        static void WriteJsonResponse(HttpListenerResponse resp, List<ScannedImage> images, string status)
+        static void WriteJsonResponse(HttpListenerResponse resp, List<ScannedImage> images, string status, int statusCode)
         {
+            resp.StatusCode = statusCode;
             resp.ContentType = "application/json; charset=utf-8";
             resp.Headers.Add("Access-Control-Allow-Origin", "*");
 
