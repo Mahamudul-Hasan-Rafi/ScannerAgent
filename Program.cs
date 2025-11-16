@@ -6,6 +6,9 @@ using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using WIA;
+using System.Text;
+using System.IO;
+using Newtonsoft.Json;
 
 static class WiaFormatID
 {
@@ -50,10 +53,20 @@ namespace ScannerAgent
         public const uint BASE_VAL_WIA_ERROR = 0x80210000;
         public const uint WIA_ERROR_PAPER_EMPTY = BASE_VAL_WIA_ERROR + 3;
     }
+
+    public class ScanRequest
+    {
+        public string Mode { get; set; }
+        public string Format { get; set; }
+        public int? Dpi { get; set; }
+        public int? Color { get; set; }
+        public string DeviceId { get; set; }
+    }
+
     class Program
     {
         static readonly SemaphoreSlim ScanSemaphore = new SemaphoreSlim(1, 1);
-        static readonly TimeSpan ScanTimeout = TimeSpan.FromMinutes(5);
+        static readonly TimeSpan ScanTimeout = TimeSpan.FromMinutes(2);
 
         const int WIA_DPS_DOCUMENT_HANDLING_CAPABILITIES = 3086;
         const int WIA_DPS_DOCUMENT_HANDLING_SELECT = 3088;
@@ -75,10 +88,16 @@ namespace ScannerAgent
         [STAThread]
         static void Main()
         {
+
             var listener = new HttpListener();
             string url = "http://10.11.200.110:9257/";
             listener.Prefixes.Add(url);
             listener.Start();
+
+            // in Program.Main (near start)
+            Logger.Init(); // optional: Logger.Init(@"C:\Logs");
+            Logger.Info($"Scanner agent running at {url}");
+
             Console.WriteLine($"Scanner agent running at {url}");
             Console.WriteLine("Endpoints:");
             Console.WriteLine("  GET  /ping                  - Health check");
@@ -121,11 +140,23 @@ namespace ScannerAgent
 
                 if (req.Url.AbsolutePath == "/scan" && req.HttpMethod=="POST")
                 {
-                    string mode = req.QueryString["mode"] ?? "auto";
-                    string format = req.QueryString["format"] ?? "jpeg";
-                    int dpi = int.Parse(req.QueryString["dpi"] ?? "300");
-                    int color = int.Parse(req.QueryString["color"] ?? "4");
-                    string deviceId = req.QueryString["deviceId"];
+                    string requestBody;
+
+                    using (var reader = new StreamReader(req.InputStream))
+                    {
+                        requestBody = reader.ReadToEnd();
+                    }
+
+                    // Deserialize the request body into an object
+                    var requestData = JsonConvert.DeserializeObject<ScanRequest>(requestBody);
+
+                    // Use the deserialized data, with fallback values if necessary
+                    string mode = requestData.Mode ?? "auto";
+                    string format = requestData.Format ?? "jpeg";
+                    int dpi = requestData.Dpi ?? 300;
+                    int color = requestData.Color ?? 4;
+                    string deviceId = requestData.DeviceId;
+
                     HandleScan(resp, mode, format, dpi, color, deviceId);
                     return;
                 }
@@ -677,14 +708,15 @@ namespace ScannerAgent
                 string mimeType = "image/jpeg";
                 if (imageFile.FormatID == WiaFormatID.wiaFormatPNG) mimeType = "image/png";
                 else if (imageFile.FormatID == WiaFormatID.wiaFormatTIFF) mimeType = "image/tiff";
+                else if (imageFile.FormatID == WiaFormatID.wiaFormatBMP) mimeType= "image/bmp";
 
                 return new ScannedImage
-                {
-                    PageNumber = pageNumber,
-                    Base64Data = $"data:{mimeType};base64,{base64}",
-                    Size = imageBytes.Length,
-                    Format = mimeType
-                };
+                    {
+                        PageNumber = pageNumber,
+                        Base64Data = $"data:{mimeType};base64,{base64}",
+                        Size = imageBytes.Length,
+                        Format = mimeType
+                    };
             }
             finally
             {
