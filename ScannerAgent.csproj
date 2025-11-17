@@ -61,9 +61,18 @@
     <Reference Include="System.Xml" />
   </ItemGroup>
   <ItemGroup>
+    <Compile Include="Controllers\ScannerController.cs" />
     <Compile Include="Logger.cs" />
+    <Compile Include="Model\DeviceInformation.cs" />
+    <Compile Include="Model\ScannedImage.cs" />
+    <Compile Include="Model\ScanRequest.cs" />
+    <Compile Include="Model\WiaFormatID.cs" />
     <Compile Include="Program.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
+    <Compile Include="ScannerHttpListener.cs" />
+    <Compile Include="Services\ScannerService.cs" />
+    <Compile Include="Startup.cs" />
+    <Compile Include="Utils\ScannerUtils.cs" />
   </ItemGroup>
   <ItemGroup>
     <None Include="App.config" />
@@ -95,5 +104,6 @@
       <Install>false</Install>
     </BootstrapperPackage>
   </ItemGroup>
+  <ItemGroup />
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
 </Project>
