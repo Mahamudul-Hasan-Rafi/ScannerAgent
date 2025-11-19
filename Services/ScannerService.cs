@@ -154,9 +154,9 @@ namespace ScannerAgent.Services
 
                     devicesList.Add(new DeviceInformation
                     {
-                        Id = id,
-                        Name = name,
-                        Type = type
+                        id = id,
+                        name = name,
+                        type = type
                     });
                 }
             }

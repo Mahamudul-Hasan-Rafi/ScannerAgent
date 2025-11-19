@@ -66,6 +66,7 @@
     <Compile Include="Model\DeviceInformation.cs" />
     <Compile Include="Model\ScannedImage.cs" />
     <Compile Include="Model\ScanRequest.cs" />
+    <Compile Include="Model\ScanResponse.cs" />
     <Compile Include="Model\WiaFormatID.cs" />
     <Compile Include="Program.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />

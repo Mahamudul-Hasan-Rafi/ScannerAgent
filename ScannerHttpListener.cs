@@ -1,12 +1,13 @@
-﻿using EScanner.Controllers;
-using EScanner.Model;
+﻿using Newtonsoft.Json;
+using ScannerAgent.Controllers;
+using ScannerAgent.Model;
 using System;
 using System.IO;
 using System.Net;
+using System.Text;
 using System.Threading.Tasks;
-using Newtonsoft.Json;
 
-namespace EScanner
+namespace ScannerAgent
 {
     public class ScannerHttpListener
     {
@@ -73,7 +74,16 @@ namespace EScanner
                     var scanRequest = JsonConvert.DeserializeObject<ScanRequest>(requestBody);
                     var result = await _controller.ScanAsync(scanRequest);
 
-                    WriteJsonResponse(resp, result);
+                    // Set HTTP status from service result and send a clean JSON payload
+                    resp.StatusCode = result.statusCode;
+                    var payload = new ScanResponse
+                    {
+                        images = result.images,
+                        status = result.status,
+                        statusCode = result.statusCode
+                    };
+
+                    WriteJsonResponse(resp, payload);
                     return;
                 }
 
@@ -103,12 +113,28 @@ namespace EScanner
 
         private void WriteText(HttpListenerResponse resp, string text)
         {
-            resp.ContentType = "text/plain; charset=utf-8";
-            resp.Headers.Add("Access-Control-Allow-Origin", "*");
-            var writer = new StreamWriter(resp.OutputStream);
-            writer.Write(text);
-            writer.Flush();
-            resp.OutputStream.Close();
+            try
+            {
+                resp.ContentType = "text/plain; charset=utf-8";
+                resp.Headers.Add("Access-Control-Allow-Origin", "*");
+
+                var buffer = Encoding.UTF8.GetBytes(text ?? string.Empty);
+                resp.ContentLength64 = buffer.LongLength;
+
+                using (var outStream = resp.OutputStream)
+                {
+                    outStream.Write(buffer, 0, buffer.Length);
+                    outStream.Flush();
+                }
+            }
+            catch
+            {
+                // swallow to avoid throwing while trying to write error responses
+            }
+            finally
+            {
+                try { resp.OutputStream.Close(); } catch { }
+            }
         }
 
         private void WriteJsonResponse(HttpListenerResponse resp, object obj)
@@ -116,17 +142,25 @@ namespace EScanner
             try
             {
                 string json = JsonConvert.SerializeObject(obj);
+                var buffer = Encoding.UTF8.GetBytes(json ?? string.Empty);
+
                 resp.ContentType = "application/json; charset=utf-8";
                 resp.Headers.Add("Access-Control-Allow-Origin", "*");
-                using (var writer = new StreamWriter(resp.OutputStream))
+
+                // We know the payload length, so set Content-Length for predictable behavior.
+                // For very large payloads you can instead use resp.SendChunked = true and stream chunks.
+                resp.ContentLength64 = buffer.LongLength;
+
+                using (var outStream = resp.OutputStream)
                 {
-                    writer.Write(json);
-                    writer.Flush();
+                    outStream.Write(buffer, 0, buffer.Length);
+                    outStream.Flush();
                 }
             }
-            catch
+            catch (Exception e)
             {
-                // In case even writing fails, don't throw
+                // Log and ignore - avoid throwing while trying to write error responses
+                Console.WriteLine("WriteJsonResponse error: " + e.Message);
             }
             finally
             {
@@ -134,4 +168,5 @@ namespace EScanner
             }
         }
     }
+
 }
