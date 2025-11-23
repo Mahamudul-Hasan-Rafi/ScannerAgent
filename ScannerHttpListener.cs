@@ -1,6 +1,7 @@
 ﻿using Newtonsoft.Json;
 using ScannerAgent.Controllers;
 using ScannerAgent.Model;
+using ScannerAgent.Services;
 using System;
 using System.IO;
 using System.Net;
@@ -84,6 +85,20 @@ namespace ScannerAgent
                     };
 
                     WriteJsonResponse(resp, payload);
+                    return;
+                }
+
+                // Scan Stream
+                if (req.Url.AbsolutePath == "/scan/stream" && req.HttpMethod == "POST")
+                {
+
+                    string requestBody;
+                    using (var reader = new StreamReader(req.InputStream))
+                        requestBody = reader.ReadToEnd();
+
+                    var scanRequest = JsonConvert.DeserializeObject<ScanRequest>(requestBody);
+
+                    await _controller.StreamScannedDocumentAsync(context, scanRequest);
                     return;
                 }
 

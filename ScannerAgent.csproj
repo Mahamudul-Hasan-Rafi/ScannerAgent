@@ -64,6 +64,7 @@
     <Compile Include="Controllers\ScannerController.cs" />
     <Compile Include="Logger.cs" />
     <Compile Include="Model\DeviceInformation.cs" />
+    <Compile Include="Model\DeviceListResponse.cs" />
     <Compile Include="Model\ScannedImage.cs" />
     <Compile Include="Model\ScanRequest.cs" />
     <Compile Include="Model\ScanResponse.cs" />

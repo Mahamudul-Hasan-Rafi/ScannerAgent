@@ -1,8 +1,12 @@
-﻿using ScannerAgent.Model;
+﻿using Newtonsoft.Json;
+using ScannerAgent.Model;
 using ScannerAgent.Utils;
 using System;
 using System.Collections.Generic;
+using System.IO;
+using System.Net;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using WIA;
@@ -109,9 +113,128 @@ namespace ScannerAgent.Services
             }
         }
 
-        public List<DeviceInformation> ListDevices()
+
+        public async Task StreamScanAsync(HttpListenerContext context, ScanRequest request)
         {
-            var devicesList = new List<DeviceInformation>();
+            if (!_scanSemaphore.Wait(0))
+            {
+                WriteStreamText(context.Response.OutputStream, "{\"status\":\"Another scan is in progress\", \"statusCode\":423}\n");
+                return;
+            }
+
+            try
+            {
+                var resp = context.Response;
+                resp.StatusCode = 200;
+                resp.ContentType = "application/x-ndjson"; // streaming JSON
+                resp.SendChunked = true;
+
+                var output = resp.OutputStream;
+
+                var tcs = new TaskCompletionSource<bool>();
+
+                Thread staThread = new Thread(() =>
+                {
+                    Device device = null;
+
+                    try
+                    {
+                        // Connect device
+                        device = ConnectToDeviceById(request.DeviceId);
+                        if (device == null)
+                        {
+                            WriteStreamText(output, "{\"status\":\"Device not found\", \"statusCode\":404}\n");
+                            tcs.SetResult(true);
+                            return;
+                        }
+
+                        // ---------------------------
+                        // MODE DETECTION
+                        // ---------------------------
+                        int selectFlags = GetProperty(device.Properties, WIA_DPS_DOCUMENT_HANDLING_SELECT);
+                        bool hasFeeder = (selectFlags & FEEDER) != 0;
+                        bool hasFlatbed = (selectFlags & FLATBED) != 0;
+
+                        string mode = request.Mode?.ToLower() ?? "auto";
+
+                        if (mode == "auto")
+                        {
+                            if (hasFeeder)
+                            {
+                                int status = GetProperty(device.Properties, WIA_DPS_DOCUMENT_HANDLING_STATUS);
+                                mode = (status & FEED_READY) != 0 ? "adf" : "flatbed";
+                            }
+                            else mode = "flatbed";
+                        }
+
+                        // SELECT MODE
+                        if (mode == "adf" && hasFeeder)
+                            SetProperty(device.Properties, WIA_DPS_DOCUMENT_HANDLING_SELECT, FEEDER);
+                        else
+                            SetProperty(device.Properties, WIA_DPS_DOCUMENT_HANDLING_SELECT, FLATBED);
+
+                        // SETTINGS
+                        string wiaFormat = ScannerUtils.GetWiaFormat(request.Format ?? "jpeg");
+                        int dpi = request.Dpi ?? 300;
+                        int color = request.Color ?? 4;
+
+                        // ---------------------------
+                        // STREAM PAGE-BY-PAGE
+                        // ---------------------------
+                        foreach (var scanned in StreamPages(device, wiaFormat, dpi, color))
+                        {
+                            var json = JsonConvert.SerializeObject(scanned);
+                            WriteStreamText(output, json + "\n");
+                        }
+
+                        // End message
+                        WriteStreamText(output, "{\"status\":\"done\"}\n");
+                        tcs.SetResult(true);
+                    }
+                    catch (Exception ex)
+                    {
+                        WriteStreamText(output, "{\"status\":\"error\", \"message\":\"" +
+                            ex.Message.Replace("\"", "'") + "\"}\n");
+                        tcs.SetResult(true);
+                    }
+                    finally
+                    {
+                        ScannerUtils.ReleaseCom(device);
+                    }
+                });
+
+                staThread.SetApartmentState(ApartmentState.STA);
+                staThread.Start();
+
+                // Wait for scan completion
+                await Task.WhenAny(tcs.Task, Task.Delay(_scanTimeout));
+
+                if (!tcs.Task.IsCompleted)
+                {
+                    WriteStreamText(output, "{\"status\":\"timeout\",\"statusCode\":408}\n");
+                }
+            }
+            finally
+            {
+                _scanSemaphore.Release();
+            }
+        }
+
+
+
+
+
+        public DeviceListResponse ListDevices()
+        {
+
+            var response = new DeviceListResponse
+            {
+                devices = new List<DeviceInformation>(),
+                status = "ok",
+                statusCode = 200
+            };
+
+            //var devicesList = new List<DeviceInformation>();
 
             try
             {
@@ -152,7 +275,7 @@ namespace ScannerAgent.Services
                     if (string.IsNullOrEmpty(name))
                         name = id;
 
-                    devicesList.Add(new DeviceInformation
+                    response.devices.Add(new DeviceInformation
                     {
                         id = id,
                         name = name,
@@ -163,9 +286,13 @@ namespace ScannerAgent.Services
             catch (Exception ex)
             {
                 Console.WriteLine($"Error listing devices: {ex.Message}");
+                // return an error response instead of swallowing the exception
+                response.devices = new List<DeviceInformation>();
+                response.status = "Error listing devices: " + ex.Message;
+                response.statusCode = 500;
             }
 
-            return devicesList;
+            return response;
         }
 
 
@@ -265,6 +392,48 @@ namespace ScannerAgent.Services
             return images;
         }
 
+        // page → yields → scans next → yields
+        private IEnumerable<ScannedImage> StreamPages(Device device, string wiaFormat, int dpi, int color)
+        {
+            int page = 0;
+
+            while (true)
+            {
+                var item = device.Items[1] as Item;
+                if (item == null) yield break;
+
+                // resolution
+                SetProperty(item.Properties, WIA_IPS_XRES, dpi);
+                SetProperty(item.Properties, WIA_IPS_YRES, dpi);
+
+                try { SetProperty(item.Properties, WIA_IPS_CUR_INTENT, color); } catch { }
+
+                // perform transfer using a helper so any COMException is handled outside the iterator's try/catch
+                bool noMorePages;
+
+                ImageFile img = TryTransfer(item, wiaFormat, out noMorePages);
+
+                if (noMorePages) yield break;
+
+                if (img == null) yield break;
+
+                 page++;
+
+                 yield return ScannerUtils.ConvertImageToBase64(img, page);
+
+                 ScannerUtils.ReleaseCom(img);
+                
+               
+
+                // Check feeder more pages
+                int status = GetProperty(device.Properties, WIA_DPS_DOCUMENT_HANDLING_STATUS);
+                if ((status & FEED_READY) == 0)
+                    yield break;
+            }
+        }
+
+
+
         private void SetProperty(Properties props, int id, object value)
         {
             foreach (Property p in props)
@@ -289,5 +458,34 @@ namespace ScannerAgent.Services
             }
             return 0;
         }
+
+        private void WriteStreamText(Stream stream, string text)
+        {
+            var bytes = Encoding.UTF8.GetBytes(text);
+            stream.Write(bytes, 0, bytes.Length);
+            stream.Flush();
+        }
+
+        private ImageFile TryTransfer(Item item, string wiaFormat, out bool noMorePages)
+        {
+            noMorePages = false;
+            try
+            {
+                return (ImageFile)item.Transfer(wiaFormat);
+            }
+            catch (COMException ex)
+            {
+                // No more pages in feeder
+                if ((uint)ex.ErrorCode == 0x80210003)
+                {
+                    noMorePages = true;
+                    return null;
+                }
+
+                // rethrow other COM exceptions
+                throw;
+            }
+        }
+
     }
 }

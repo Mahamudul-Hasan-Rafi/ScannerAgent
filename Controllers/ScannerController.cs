@@ -2,6 +2,7 @@
 using ScannerAgent.Model;
 using ScannerAgent.Services;
 using System.Collections.Generic;
+using System.Net;
 using System.Threading.Tasks;
 using WIA;
 
@@ -18,9 +19,12 @@ namespace ScannerAgent.Controllers
             return result;
         }
 
+        public async Task StreamScannedDocumentAsync(HttpListenerContext context, ScanRequest request)
+        {
+            await _scannerService.StreamScanAsync(context, request);
+        }
 
-
-        public List<DeviceInformation> Devices()
+        public DeviceListResponse Devices()
         {
             return _scannerService.ListDevices();
         }
