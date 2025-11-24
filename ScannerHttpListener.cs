@@ -47,12 +47,16 @@ namespace ScannerAgent
 
             try
             {
+                // Ensure CORS headers are present for EVERY response
+                AddCorsHeaders(resp, req);
+
                 // Handle CORS
                 if (req.HttpMethod == "OPTIONS")
                 {
-                    resp.Headers.Add("Access-Control-Allow-Origin", "*");
-                    resp.Headers.Add("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-                    resp.Headers.Add("Access-Control-Allow-Headers", "Content-Type");
+                    //resp.Headers.Add("Access-Control-Allow-Origin", "*");
+                    //resp.Headers.Add("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+                    //resp.Headers.Add("Access-Control-Allow-Headers", "Content-Type");
+                    //resp.Headers.Set("Access-Control-Max-Age", "600");
                     resp.StatusCode = 200;
                     resp.Close();
                     return;
@@ -131,7 +135,6 @@ namespace ScannerAgent
             try
             {
                 resp.ContentType = "text/plain; charset=utf-8";
-                resp.Headers.Add("Access-Control-Allow-Origin", "*");
 
                 var buffer = Encoding.UTF8.GetBytes(text ?? string.Empty);
                 resp.ContentLength64 = buffer.LongLength;
@@ -160,7 +163,6 @@ namespace ScannerAgent
                 var buffer = Encoding.UTF8.GetBytes(json ?? string.Empty);
 
                 resp.ContentType = "application/json; charset=utf-8";
-                resp.Headers.Add("Access-Control-Allow-Origin", "*");
 
                 // We know the payload length, so set Content-Length for predictable behavior.
                 // For very large payloads you can instead use resp.SendChunked = true and stream chunks.
@@ -181,6 +183,29 @@ namespace ScannerAgent
             {
                 try { resp.OutputStream.Close(); } catch { }
             }
+        }
+
+
+        // Centralized CORS header helper — call this before writing response body.
+        private void AddCorsHeaders(HttpListenerResponse resp, HttpListenerRequest req)
+        {
+            var origin = req.Headers["Origin"];
+            if (!string.IsNullOrEmpty(origin))
+            {
+                // Echo the request origin if present (required when credentials are used)
+                resp.Headers.Set("Access-Control-Allow-Origin", origin);
+                // Let caches know responses vary by Origin
+                resp.Headers.Set("Vary", "Origin");
+                // If you support cookies/Authorization, enable credentials:
+                // resp.Headers.Set("Access-Control-Allow-Credentials", "true");
+            }
+            else
+            {
+                resp.Headers.Set("Access-Control-Allow-Origin", "*");
+            }
+
+            resp.Headers.Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+            resp.Headers.Set("Access-Control-Allow-Headers", "Content-Type");
         }
     }
 
