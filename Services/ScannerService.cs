@@ -1,4 +1,5 @@
 ﻿using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using ScannerAgent.Model;
 using ScannerAgent.Utils;
 using System;
@@ -183,11 +184,14 @@ namespace ScannerAgent.Services
                         // ---------------------------
                         foreach (var scanned in StreamPages(device, wiaFormat, dpi, color))
                         {
-                            var json = JsonConvert.SerializeObject(scanned);
-                            WriteStreamText(output, json + "\n");
+                            var j = JObject.FromObject(scanned);
+                            j["status"] = "ok";
+                            j["statusCode"] = 200;
+                            WriteStreamText(output, j.ToString(Formatting.None) + "\n");
                         }
 
                         // End message
+                        // followed by the thread returning, which causes the output stream to close.
                         WriteStreamText(output, "{\"status\":\"done\"}\n");
                         tcs.SetResult(true);
                     }
