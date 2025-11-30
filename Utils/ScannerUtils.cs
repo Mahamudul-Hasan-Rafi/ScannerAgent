@@ -46,7 +46,7 @@ namespace ScannerAgent.Utils
                 return new ScannedImage
                 {
                     PageNumber = pageNumber,
-                    Base64Data = $"data:{mimeType};base64,{base64}",
+                    Base64Data = base64, // $"data:{mimeType};base64,{base64}",
                     Size = imageBytes.Length,
                     Format = mimeType
                 };
