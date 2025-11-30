@@ -11,13 +11,14 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using WIA;
+using System.Diagnostics;
 
 namespace ScannerAgent.Services
 {
     public class ScannerService
     {
         private readonly SemaphoreSlim _scanSemaphore = new SemaphoreSlim(1, 1);
-        private readonly TimeSpan _scanTimeout = TimeSpan.FromMinutes(2);
+        private readonly TimeSpan _scanTimeout = TimeSpan.FromMinutes(5); // up to 20 ADF pages at 15s each
 
         const int WIA_DPS_DOCUMENT_HANDLING_SELECT = 3088;   
         const int WIA_DPS_DOCUMENT_HANDLING_STATUS = 3087;
@@ -106,7 +107,7 @@ namespace ScannerAgent.Services
                 if (!tcs.Task.Wait(_scanTimeout))
                     return (new List<ScannedImage>(), "Scan timed out", 408);
 
-                return tcs.Task.Result;
+                return await tcs.Task;  // tcs.Task.Result;
             }
             finally
             {
@@ -120,17 +121,27 @@ namespace ScannerAgent.Services
             if (!_scanSemaphore.Wait(0))
             {
                 WriteStreamText(context.Response.OutputStream, "{\"status\":\"Another scan is in progress\", \"statusCode\":423}\n");
+                try
+                {
+                    context.Response.OutputStream.Flush();
+                    context.Response.Close();
+                }
+                catch
+                {
+                    try { context.Response.OutputStream.Close(); } catch { }
+                }
                 return;
             }
 
+            var resp = context.Response;
+            var output = resp.OutputStream;
+
             try
             {
-                var resp = context.Response;
                 resp.StatusCode = 200;
                 resp.ContentType = "application/x-ndjson"; // streaming JSON
                 resp.SendChunked = true;
 
-                var output = resp.OutputStream;
 
                 var tcs = new TaskCompletionSource<bool>();
 
@@ -179,10 +190,13 @@ namespace ScannerAgent.Services
                         int dpi = request.Dpi ?? 300;
                         int color = request.Color ?? 4;
 
+                        // determine whether the device is currently using the feeder (ADF)
+                        bool feederSelected = (GetProperty(device.Properties, WIA_DPS_DOCUMENT_HANDLING_SELECT) & FEEDER) != 0;
+
                         // ---------------------------
                         // STREAM PAGE-BY-PAGE
                         // ---------------------------
-                        foreach (var scanned in StreamPages(device, wiaFormat, dpi, color))
+                        foreach (var scanned in StreamPages(device, wiaFormat, dpi, color, feederSelected))
                         {
                             var j = JObject.FromObject(scanned);
                             j["status"] = "ok";
@@ -210,16 +224,56 @@ namespace ScannerAgent.Services
                 staThread.SetApartmentState(ApartmentState.STA);
                 staThread.Start();
 
-                // Wait for scan completion
-                await Task.WhenAny(tcs.Task, Task.Delay(_scanTimeout));
+                // Wait for scan completion or overall timeout
+                var finished = await Task.WhenAny(tcs.Task, Task.Delay(_scanTimeout));
 
-                if (!tcs.Task.IsCompleted)
+                if (finished != tcs.Task)
                 {
+                    // worker didn't finish in time — notify client
                     WriteStreamText(output, "{\"status\":\"timeout\",\"statusCode\":408}\n");
                 }
+                else
+                {
+                    // ensure worker completed
+                    await tcs.Task;
+                }
+
+                // Close the response so clients reliably observe stream end
+                try
+                {
+                    resp.OutputStream.Flush();
+                    resp.Close();
+                }
+                catch
+                {
+                    try { resp.OutputStream.Close(); } catch { }
+                }
+
+            }
+            catch (Exception ex)
+            {
+                // best-effort write to stream if something unexpected escaped
+                try
+                {
+                    WriteStreamText(context.Response.OutputStream, "{\"status\":\"error\", \"message\":\"" +
+                        ex.Message.Replace("\"", "'") + "\"}\n");
+   
+                } catch { }
+                throw;
             }
             finally
             {
+                // safe finalization: flush and close the response so clients observe EOF
+                try
+                {
+                    output.Flush();
+                    resp.Close();
+                }
+                catch
+                {
+                    try { output.Close(); } catch { }
+                }
+
                 _scanSemaphore.Release();
             }
         }
@@ -397,7 +451,7 @@ namespace ScannerAgent.Services
         }
 
         // page → yields → scans next → yields
-        private IEnumerable<ScannedImage> StreamPages(Device device, string wiaFormat, int dpi, int color)
+        private IEnumerable<ScannedImage> StreamPages(Device device, string wiaFormat, int dpi, int color, bool feederSelected)
         {
             int page = 0;
 
@@ -415,19 +469,25 @@ namespace ScannerAgent.Services
                 // perform transfer using a helper so any COMException is handled outside the iterator's try/catch
                 bool noMorePages;
 
+                var sw = Stopwatch.StartNew();
                 ImageFile img = TryTransfer(item, wiaFormat, out noMorePages);
+                sw.Stop();
 
                 if (noMorePages) yield break;
 
                 if (img == null) yield break;
 
-                 page++;
+                // log duration (replace Console.WriteLine with a logger if desired)
+                page++;
+                Console.WriteLine($"[Scanner] Device={(device?.DeviceID ?? "unknown")} Page={page} TransferSeconds={sw.Elapsed.TotalSeconds:N2}");
 
-                 yield return ScannerUtils.ConvertImageToBase64(img, page);
+
+                yield return ScannerUtils.ConvertImageToBase64(img, page);
 
                  ScannerUtils.ReleaseCom(img);
-                
-               
+
+                // If device is flatbed (feeder not selected) there is only one image — stop.
+                if (!feederSelected) yield break;
 
                 // Check feeder more pages
                 int status = GetProperty(device.Properties, WIA_DPS_DOCUMENT_HANDLING_STATUS);

@@ -1,7 +1,6 @@
 ﻿using Newtonsoft.Json;
 using ScannerAgent.Controllers;
 using ScannerAgent.Model;
-using ScannerAgent.Services;
 using System;
 using System.IO;
 using System.Net;
@@ -26,10 +25,10 @@ namespace ScannerAgent
 
         public void Start()
         {
-            _listener.Start();
-            Console.WriteLine($"Listening on {_url}");
-            Task.Run(() => ListenLoop());
-        }
+                _listener.Start();
+                Console.WriteLine($"Listening on {_url}");
+                Task.Run(() => ListenLoop());
+         }
 
         private async Task ListenLoop()
         {
@@ -51,14 +50,22 @@ namespace ScannerAgent
                 AddCorsHeaders(resp, req);
 
                 // Handle CORS
+                // With this improved block:
                 if (req.HttpMethod == "OPTIONS")
                 {
-                    //resp.Headers.Add("Access-Control-Allow-Origin", "*");
-                    //resp.Headers.Add("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-                    //resp.Headers.Add("Access-Control-Allow-Headers", "Content-Type");
-                    //resp.Headers.Set("Access-Control-Max-Age", "600");
-                    resp.StatusCode = 200;
-                    resp.Close();
+                    // preflight response: no body, 204 No Content
+                    resp.StatusCode = 204;
+                    // Ensure the headers are flushed to the client
+                    try
+                    {
+                        resp.ContentLength64 = 0;
+                        resp.OutputStream.Flush();
+                    }
+                    catch { }
+                    finally
+                    {
+                        try { resp.OutputStream.Close(); } catch { }
+                    }
                     return;
                 }
 
