@@ -3,6 +3,7 @@ using ScannerAgent.Controllers;
 using ScannerAgent.Model;
 using System;
 using System.IO;
+using System.Linq;
 using System.Net;
 using System.Text;
 using System.Threading.Tasks;
@@ -47,7 +48,7 @@ namespace ScannerAgent
             try
             {
                 // Ensure CORS headers are present for EVERY response
-                AddCorsHeaders(resp, req);
+                AddCors(req, resp);
 
                 // Handle CORS
                 // With this improved block:
@@ -194,26 +195,67 @@ namespace ScannerAgent
 
 
         // Centralized CORS header helper — call this before writing response body.
-        private void AddCorsHeaders(HttpListenerResponse resp, HttpListenerRequest req)
+        private void AddCors(HttpListenerRequest req, HttpListenerResponse resp)
         {
-            var origin = req.Headers["Origin"];
-            if (!string.IsNullOrEmpty(origin))
+            string origin = req.Headers["Origin"];
+
+            // Allowed origins for your Angular frontends
+            string[] allowedOrigins =
             {
-                // Echo the request origin if present (required when credentials are used)
-                resp.Headers.Set("Access-Control-Allow-Origin", origin);
-                // Let caches know responses vary by Origin
-                resp.Headers.Set("Vary", "Origin");
-                // If you support cookies/Authorization, enable credentials:
-                // resp.Headers.Set("Access-Control-Allow-Credentials", "true");
+                "http://localhost:4200",
+                "http://192.183.155.31:4210"
+            };
+
+            bool originAllowed =
+                !string.IsNullOrEmpty(origin) &&
+                allowedOrigins.Contains(origin, StringComparer.OrdinalIgnoreCase);
+
+            // ======== PRE-FLIGHT (OPTIONS) ========
+            if (req.HttpMethod == "OPTIONS")
+            {
+                resp.StatusCode = 204;
+
+                if (originAllowed)
+                {
+                    resp.Headers["Access-Control-Allow-Origin"] = origin;
+                    resp.Headers["Vary"] = "Origin";
+
+                    // No credentials here.
+                    resp.Headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS";
+                    resp.Headers["Access-Control-Allow-Headers"] = "Content-Type, Accept, Authorization";
+
+                    resp.Headers["Access-Control-Max-Age"] = "600";
+
+                    // Important for localhost → localhost private network
+                    resp.Headers["Access-Control-Allow-Private-Network"] = "true";
+                }
+                else
+                {
+                    // fallback
+                    resp.Headers["Access-Control-Allow-Origin"] = "*";
+                    resp.Headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS";
+                    resp.Headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization";
+                }
+
+                resp.OutputStream.Close();
+                return;
+            }
+
+            // ======== NORMAL REQUESTS (GET/POST etc.) ========
+            if (originAllowed)
+            {
+                resp.Headers["Access-Control-Allow-Origin"] = origin;
+                resp.Headers["Vary"] = "Origin";
+
+                // No credentials
+                resp.Headers["Access-Control-Allow-Private-Network"] = "true";
             }
             else
             {
-                resp.Headers.Set("Access-Control-Allow-Origin", "*");
+                resp.Headers["Access-Control-Allow-Origin"] = "*"; // fallback
             }
-
-            resp.Headers.Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-            resp.Headers.Set("Access-Control-Allow-Headers", "Content-Type");
         }
+
     }
 
 }
