@@ -217,12 +217,12 @@ namespace ScannerAgent
 
                 if (originAllowed)
                 {
-                    resp.Headers["Access-Control-Allow-Origin"] = origin;
+                    resp.Headers["Access-Control-Allow-Origin"] = "*";
                     resp.Headers["Vary"] = "Origin";
 
                     // No credentials here.
-                    resp.Headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS";
-                    resp.Headers["Access-Control-Allow-Headers"] = "Content-Type, Accept, Authorization";
+                    resp.Headers["Access-Control-Allow-Methods"] = "*";
+                    resp.Headers["Access-Control-Allow-Headers"] = "*";
 
                     resp.Headers["Access-Control-Max-Age"] = "600";
 
@@ -233,8 +233,9 @@ namespace ScannerAgent
                 {
                     // fallback
                     resp.Headers["Access-Control-Allow-Origin"] = "*";
-                    resp.Headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS";
-                    resp.Headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization";
+                    resp.Headers["Access-Control-Allow-Methods"] = "*";
+                    resp.Headers["Access-Control-Allow-Headers"] = "*";
+                    resp.Headers["Access-Control-Allow-Private-Network"] = "true";
                 }
 
                 resp.OutputStream.Close();
@@ -244,7 +245,7 @@ namespace ScannerAgent
             // ======== NORMAL REQUESTS (GET/POST etc.) ========
             if (originAllowed)
             {
-                resp.Headers["Access-Control-Allow-Origin"] = origin;
+                resp.Headers["Access-Control-Allow-Origin"] = "*";
                 resp.Headers["Vary"] = "Origin";
 
                 // No credentials
@@ -253,6 +254,7 @@ namespace ScannerAgent
             else
             {
                 resp.Headers["Access-Control-Allow-Origin"] = "*"; // fallback
+                resp.Headers["Access-Control-Allow-Private-Network"] = "true";
             }
         }
 
